@@ -1,0 +1,13 @@
+services:
+  api:
+    build: .
+    ports:
+      - "8787:8787"
+    environment:
+      CI: "true"
+      WRANGLER_SEND_METRICS: "false"
+    volumes:
+      - ims-data:/app/.wrangler
+
+volumes:
+  ims-data:
