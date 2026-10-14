@@ -2,10 +2,11 @@ import { Hono } from "hono"
 
 import { audit, notify, notifyOfficers } from "./audit"
 import { hashPassword, id, nowIso, signToken, verifyPassword } from "./crypto"
-import { conflict, fail, like, noContent, notFound, originOf, pageQuery } from "./http"
+import { conflict, fail, forbidden, like, noContent, notFound, originOf, pageQuery } from "./http"
 import { permit, portalOf, requirePortal, requireStaff, staffOf } from "./middleware"
 import { PERMISSIONS } from "./permissions"
 import {
+  countUnverifiedDocuments,
   DOCUMENT_CATEGORIES,
   draftAssignments,
   getApplication,
@@ -527,31 +528,99 @@ api.put("/applications/:id/documents/:documentId/verification", requireStaff, pe
   return c.json(await getApplicationDocument(c.env.DB, application.id, doc.id, originOf(c)))
 })
 
-api.post("/applications/:id/decision", requireStaff, permit("applicant.update"), async (c) => {
-  const body = await c.req.json<{ action: string; note?: string }>()
+type DecisionAction =
+  | "start_review"
+  | "pass_first_review"
+  | "return_to_first_review"
+  | "request_supplement"
+  | "approve"
+  | "reject"
+
+/** 各状态与层级下可做的决定和所需权限，与前端 src/features/applications/workflow.ts 一致。 */
+function decisionStep(status: string, level: string | null) {
+  if (status === "submitted" || status === "supplement_required") {
+    return { level: null, actions: ["start_review"] as DecisionAction[], permission: "application.review" as const }
+  }
+  if (status !== "under_review") return null
+  return level === "final_review"
+    ? {
+        level: "final_review" as const,
+        actions: ["approve", "return_to_first_review", "request_supplement", "reject"] as DecisionAction[],
+        permission: "application.approve" as const,
+      }
+    : {
+        level: "first_review" as const,
+        actions: ["pass_first_review", "request_supplement", "reject"] as DecisionAction[],
+        permission: "application.review" as const,
+      }
+}
+
+/** 必须填写意见的决定：申请人或下一级审批人要看到理由。 */
+const NOTE_REQUIRED: Partial<Record<DecisionAction, string>> = {
+  request_supplement: "请填写补件说明",
+  reject: "请填写驳回理由",
+  return_to_first_review: "请填写退回理由",
+}
+
+/** 这几种决定的意见写入 reviewNote，申请人在门户能看到；其余只在内部审批记录里。 */
+const PUBLIC_NOTE_ACTIONS: DecisionAction[] = ["request_supplement", "reject", "approve"]
+
+api.post("/applications/:id/decision", requireStaff, async (c) => {
+  const body = await c.req.json<{ action: DecisionAction; note?: string }>()
   const application = await getApplication(c.env.DB, c.req.param("id"), originOf(c))
   if (!application) notFound("申请")
   const me = staffOf(c)
   const note = (body.note ?? "").trim()
-  let next = ""
-  let timelineNote = ""
-  if (body.action === "start_review" && (application.status === "submitted" || application.status === "supplement_required")) {
-    next = "under_review"
-    timelineNote = note || "已受理，进入审核。"
-  } else if (body.action === "request_supplement" && application.status === "under_review") {
-    if (!note) fail(400, "VALIDATION_FAILED", "请填写补件说明。", { note: "请填写补件说明" })
-    next = "supplement_required"
-    timelineNote = note
-  } else if (body.action === "approve" && application.status === "under_review") {
-    next = "approved"
-    timelineNote = note || "审核通过。"
-  } else if (body.action === "reject" && application.status === "under_review") {
-    if (!note) fail(400, "VALIDATION_FAILED", "请填写驳回理由。", { note: "请填写驳回理由" })
-    next = "rejected"
-    timelineNote = note
-  } else {
-    conflict("当前状态不能执行该审批操作。")
+
+  const step = decisionStep(application.status, application.approvalLevel)
+  if (!step || !step.actions.includes(body.action)) conflict("当前状态不能执行该审批操作。")
+  if (!me.permissions.includes(step.permission)) {
+    forbidden(step.level === "final_review" ? "当前账号没有终审权限。" : "当前账号没有初审权限。")
   }
+  const noteMessage = NOTE_REQUIRED[body.action]
+  if (noteMessage && !note) fail(400, "VALIDATION_FAILED", `${noteMessage}。`, { note: noteMessage })
+  if (step.level === "final_review") {
+    // 双人复核：以最近一次初审通过的人为准，退回初审后换人重新初审则以新的初审人为准。
+    const firstReview = [...application.approvals].reverse().find((record) => record.action === "pass_first_review")
+    if (firstReview?.actorId === me.id) forbidden("同一份申请的初审人不能再做终审。")
+  }
+  if (body.action === "pass_first_review" || body.action === "approve") {
+    const unverified = await countUnverifiedDocuments(c.env.DB, application.id)
+    if (unverified) conflict(`还有 ${unverified} 份申请材料未核验通过。`)
+  }
+
+  let next = application.status
+  let nextLevel: string | null = step.level
+  let timelineNote: string | null = null
+  switch (body.action) {
+    case "start_review":
+      next = "under_review"
+      nextLevel = "first_review"
+      timelineNote = "已受理，进入审核。"
+      break
+    case "pass_first_review":
+      nextLevel = "final_review"
+      break
+    case "return_to_first_review":
+      nextLevel = "first_review"
+      break
+    case "request_supplement":
+      next = "supplement_required"
+      nextLevel = null
+      timelineNote = note
+      break
+    case "reject":
+      next = "rejected"
+      nextLevel = null
+      timelineNote = note
+      break
+    case "approve":
+      next = "approved"
+      nextLevel = null
+      timelineNote = note || "审核通过。"
+      break
+  }
+
   const at = nowIso()
   let fileNo = application.fileNo
   if (next === "approved" && !fileNo) {
@@ -580,15 +649,25 @@ api.post("/applications/:id/decision", requireStaff, permit("applicant.update"),
     }
     timelineNote = note || "审核通过，已建立申请人档案。"
   }
+  const reviewNote = PUBLIC_NOTE_ACTIONS.includes(body.action) ? note || application.reviewNote : application.reviewNote
   await c.env.DB
-    .prepare("UPDATE applications SET status = ?, review_note = ?, file_no = ?, updated_at = ? WHERE id = ?")
-    .bind(next, note || application.reviewNote, fileNo, at, application.id)
+    .prepare("UPDATE applications SET status = ?, approval_level = ?, review_note = ?, file_no = ?, updated_at = ? WHERE id = ?")
+    .bind(next, nextLevel, reviewNote, fileNo, at, application.id)
     .run()
   await c.env.DB
-    .prepare("INSERT INTO application_timeline (application_id, status, note, actor, at) VALUES (?, ?, ?, ?, ?)")
-    .bind(application.id, next, timelineNote, me.fullName, at)
+    .prepare(
+      `INSERT INTO application_approvals (id, application_id, level, action, note, actor_id, actor_name, at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    )
+    .bind(id("apv"), application.id, step.level, body.action, note, me.id, me.fullName, at)
     .run()
-  await notify(c.env.DB, "portal", application.accountId, "申请状态已更新", `${application.applicationNo ?? "你的申请"}：${timelineNote}`)
+  if (timelineNote !== null) {
+    await c.env.DB
+      .prepare("INSERT INTO application_timeline (application_id, status, note, actor, at) VALUES (?, ?, ?, ?, ?)")
+      .bind(application.id, next, timelineNote, me.fullName, at)
+      .run()
+    await notify(c.env.DB, "portal", application.accountId, "申请状态已更新", `${application.applicationNo ?? "你的申请"}：${timelineNote}`)
+  }
   await audit(c.env.DB, { type: "staff", id: me.id, name: me.fullName }, "application.decision", "application", application.id, `${body.action} ${application.applicationNo}`)
   return c.json(await getApplication(c.env.DB, application.id, originOf(c)))
 })

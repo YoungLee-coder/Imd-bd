@@ -187,6 +187,7 @@ interface AppRow {
   passport_issue_date: string
   passport_expiry_date: string
   review_note: string
+  approval_level: string | null
   file_no: string | null
   submitted_at: string | null
   created_at: string
@@ -198,6 +199,10 @@ export async function readApplication(db: D1Database, row: AppRow, origin: strin
     .prepare("SELECT status, note, actor, at FROM application_timeline WHERE application_id = ? ORDER BY id")
     .bind(row.id)
     .all<{ status: string; note: string; actor: string | null; at: string }>()
+  const approvals = await db
+    .prepare("SELECT * FROM application_approvals WHERE application_id = ? ORDER BY at, rowid")
+    .bind(row.id)
+    .all<{ id: string; level: string | null; action: string; note: string; actor_id: string; actor_name: string; at: string }>()
   return {
     id: row.id,
     applicationNo: row.application_no,
@@ -226,6 +231,16 @@ export async function readApplication(db: D1Database, row: AppRow, origin: strin
     passportExpiryDate: row.passport_expiry_date,
     attachments: await listAttachments(db, "application", row.id, origin),
     reviewNote: row.review_note,
+    approvalLevel: row.status === "under_review" ? (row.approval_level ?? "first_review") : null,
+    approvals: approvals.results.map((a) => ({
+      id: a.id,
+      level: a.level,
+      action: a.action,
+      note: a.note,
+      actorId: a.actor_id,
+      actorName: a.actor_name,
+      at: a.at,
+    })),
     fileNo: row.file_no,
     timeline: timeline.results.map((t) => ({ status: t.status, note: t.note, actor: t.actor, at: t.at })),
     submittedAt: row.submitted_at,
