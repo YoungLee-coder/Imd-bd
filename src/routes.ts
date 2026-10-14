@@ -5,7 +5,17 @@ import { hashPassword, id, nowIso, signToken, verifyPassword } from "./crypto"
 import { conflict, fail, like, noContent, notFound, originOf, pageQuery } from "./http"
 import { permit, portalOf, requirePortal, requireStaff, staffOf } from "./middleware"
 import { PERMISSIONS } from "./permissions"
-import { draftAssignments, getApplication, listAttachments, readApplication, storeFiles } from "./records"
+import {
+  DOCUMENT_CATEGORIES,
+  draftAssignments,
+  getApplication,
+  getApplicationDocument,
+  listApplicationDocuments,
+  listAttachments,
+  readApplication,
+  storeFiles,
+  type DocumentCategory,
+} from "./records"
 import { findStaffByUsername, loadStaff, nextCounter, publicPortal, publicStaff } from "./session"
 import type { AppEnv } from "./types"
 
@@ -441,6 +451,80 @@ api.get("/applications/:id", requireStaff, permit("applicant.read"), async (c) =
   const application = await getApplication(c.env.DB, c.req.param("id"), originOf(c))
   if (!application) notFound("申请")
   return c.json(application)
+})
+
+/** 只有受理流程中的申请可以代传和核验材料；通过、驳回、撤回后材料只读。 */
+const DOCUMENT_EDITABLE_STATUSES = ["submitted", "under_review", "supplement_required"]
+
+async function editableApplication(db: D1Database, applicationId: string) {
+  const application = await db
+    .prepare("SELECT id, application_no, status FROM applications WHERE id = ?")
+    .bind(applicationId)
+    .first<{ id: string; application_no: string | null; status: string }>()
+  if (!application) notFound("申请")
+  if (!DOCUMENT_EDITABLE_STATUSES.includes(application.status)) conflict("申请已办结或尚未提交，材料不能修改。")
+  return application
+}
+
+api.get("/applications/:id/documents", requireStaff, permit("applicant.read"), async (c) => {
+  const application = await c.env.DB.prepare("SELECT id FROM applications WHERE id = ?").bind(c.req.param("id")).first()
+  if (!application) notFound("申请")
+  return c.json(await listApplicationDocuments(c.env.DB, c.req.param("id"), originOf(c)))
+})
+
+api.post("/applications/:id/documents", requireStaff, permit("document.create"), async (c) => {
+  const application = await editableApplication(c.env.DB, c.req.param("id"))
+  const form = await c.req.formData()
+  const category = String(form.get("category") ?? "other")
+  if (!DOCUMENT_CATEGORIES.includes(category as DocumentCategory)) {
+    fail(400, "VALIDATION_FAILED", "材料分类不正确。", { category: "材料分类不正确" })
+  }
+  const files = form.getAll("files").filter((file): file is File => file instanceof File)
+  if (!files.length) fail(400, "VALIDATION_FAILED", "请选择要上传的文件。", { files: "请选择要上传的文件" })
+  const added = await storeFiles(c.env.DB, c.env.FILES, "application", application.id, files, originOf(c), {
+    category: category as DocumentCategory,
+    source: "staff",
+  })
+  await c.env.DB.prepare("UPDATE applications SET updated_at = ? WHERE id = ?").bind(nowIso(), application.id).run()
+  const me = staffOf(c)
+  await audit(c.env.DB, { type: "staff", id: me.id, name: me.fullName }, "application.document.upload", "application", application.id, `代传材料 ${added.length} 份 ${application.application_no}`)
+  const ids = new Set(added.map((file) => file.id))
+  const documents = await listApplicationDocuments(c.env.DB, application.id, originOf(c))
+  return c.json(documents.filter((doc) => ids.has(doc.id)), 201)
+})
+
+api.delete("/applications/:id/documents/:documentId", requireStaff, permit("document.create"), async (c) => {
+  const application = await editableApplication(c.env.DB, c.req.param("id"))
+  const doc = await getApplicationDocument(c.env.DB, application.id, c.req.param("documentId"), originOf(c))
+  if (!doc) notFound("材料")
+  if (doc.source !== "staff") conflict("申请人上传的材料不能由工作人员删除。")
+  if (doc.verification !== "pending") conflict("材料已核验，不能删除。")
+  await removeAttachment(c.env, doc.id)
+  await c.env.DB.prepare("UPDATE applications SET updated_at = ? WHERE id = ?").bind(nowIso(), application.id).run()
+  const me = staffOf(c)
+  await audit(c.env.DB, { type: "staff", id: me.id, name: me.fullName }, "application.document.delete", "application", application.id, `删除代传材料 ${doc.fileName}`)
+  return noContent(c)
+})
+
+api.put("/applications/:id/documents/:documentId/verification", requireStaff, permit("document.verify"), async (c) => {
+  const body = await c.req.json<{ verification?: string; note?: string }>()
+  const application = await editableApplication(c.env.DB, c.req.param("id"))
+  const doc = await getApplicationDocument(c.env.DB, application.id, c.req.param("documentId"), originOf(c))
+  if (!doc) notFound("材料")
+  if (body.verification !== "verified" && body.verification !== "rejected") {
+    fail(400, "VALIDATION_FAILED", "核验结论只能是通过或驳回。", { verification: "请选择核验结论" })
+  }
+  const note = (body.note ?? "").trim()
+  if (body.verification === "rejected" && !note) fail(400, "VALIDATION_FAILED", "请填写驳回原因。", { note: "请填写驳回原因" })
+  const me = staffOf(c)
+  const at = nowIso()
+  await c.env.DB
+    .prepare("UPDATE attachments SET verification = ?, verification_note = ?, verified_by = ?, verified_at = ? WHERE id = ?")
+    .bind(body.verification, note, me.fullName, at, doc.id)
+    .run()
+  await c.env.DB.prepare("UPDATE applications SET updated_at = ? WHERE id = ?").bind(at, application.id).run()
+  await audit(c.env.DB, { type: "staff", id: me.id, name: me.fullName }, "application.document.verify", "application", application.id, `核验材料 ${doc.fileName}：${body.verification}`)
+  return c.json(await getApplicationDocument(c.env.DB, application.id, doc.id, originOf(c)))
 })
 
 api.post("/applications/:id/decision", requireStaff, permit("applicant.update"), async (c) => {
